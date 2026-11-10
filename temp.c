@@ -888,11 +888,11 @@ static int split_pipeline(
             const char *end = p;
 
             while (begin < end &&
-                   (*begin == ' ' || *begin == '\t'))
+                   (*begin == ' ' || *begin == '\t' || *begin == '\n' || *begin == '\r'))
                 begin++;
 
             while (end > begin &&
-                   (end[-1] == ' ' || end[-1] == '\t'))
+                   (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\n' || end[-1] == '\r'))
                 end--;
 
             size_t len = (size_t)(end - begin);
@@ -1048,6 +1048,107 @@ static void execute_child_command(char *command)
     _exit(127);
 }
 
+/* Execute a command or pipeline inside command substitution. */
+static int execute_capture_command(char *command)
+{
+    char commands[MAX_COMMANDS][INPUT_SIZE];
+    int count = split_pipeline(command, commands, MAX_COMMANDS);
+
+    if (count < 0)
+    {
+        fprintf(stderr, "terminator: invalid pipeline in command substitution\n");
+        return -1;
+    }
+
+    if (count == 1)
+    {
+        execute_child_command(commands[0]);
+        return 0; /* execute_child_command exits on success or failure */
+    }
+
+    int pipes[MAX_COMMANDS - 1][2];
+    pid_t pids[MAX_COMMANDS];
+    int created = 0;
+
+    for (int i = 0; i < count - 1; i++)
+    {
+        if (pipe(pipes[i]) == -1)
+        {
+            perror("pipe");
+            for (int j = 0; j < i; j++)
+            {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            return -1;
+        }
+    }
+
+    for (int i = 0; i < count; i++)
+    {
+        pid_t child = fork();
+        if (child == -1)
+        {
+            perror("fork");
+            for (int j = 0; j < count - 1; j++)
+            {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            for (int j = 0; j < created; j++)
+                kill(pids[j], SIGTERM);
+            for (int j = 0; j < created; j++)
+                while (waitpid(pids[j], NULL, 0) == -1 && errno == EINTR) {}
+            return -1;
+        }
+
+        if (child == 0)
+        {
+            if (i > 0 && dup2(pipes[i - 1][0], STDIN_FILENO) == -1)
+            {
+                perror("dup2 pipeline stdin");
+                _exit(127);
+            }
+            if (i < count - 1 && dup2(pipes[i][1], STDOUT_FILENO) == -1)
+            {
+                perror("dup2 pipeline stdout");
+                _exit(127);
+            }
+            for (int j = 0; j < count - 1; j++)
+            {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            execute_child_command(commands[i]);
+            _exit(127);
+        }
+        pids[created++] = child;
+    }
+
+    for (int i = 0; i < count - 1; i++)
+    {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+
+    int last_status = 0;
+    for (int i = 0; i < created; i++)
+    {
+        int status = 0;
+        pid_t waited;
+        do
+        {
+            waited = waitpid(pids[i], &status, 0);
+        } while (waited == -1 && errno == EINTR);
+        if (waited == -1)
+            return -1;
+        if (i == created - 1)
+            last_status = status;
+    }
+
+    return WIFEXITED(last_status) && WEXITSTATUS(last_status) == 0 ? 0 : -1;
+}
+
 static int capture_command_output(
     const char *command,
     const char *cwd,
@@ -1100,9 +1201,8 @@ static int capture_command_output(
 
         snprintf(command_copy, sizeof(command_copy), "%s", command);
 
-        execute_child_command(command_copy);
-
-        _exit(127);
+        int command_status = execute_capture_command(command_copy);
+        _exit(command_status == 0 ? 0 : 127);
     }
 
     close(fd[1]);
@@ -1725,7 +1825,10 @@ static int change_directory(struct tab *t, const char *path)
     /* No argument: go to HOME. */
     if (path == NULL || path[0] == '\0')
     {
+
         path = getenv("HOME");
+        // path="./tmp";
+        // snprintf(temp, sizeof(temp), "%s.tmp", path);
 
         if (path == NULL || path[0] == '\0')
         {
@@ -3459,7 +3562,7 @@ int main(int argc, char *argv[])
                     {
                         struct tab *currentTab = &tabs[active_tab];
 
-                        /* Assignment Task 9: query-based Ctrl+R history search. */
+                        
                         if (currentTab->reverse_search)
                         {
                             char chars[32];
@@ -3739,10 +3842,10 @@ int main(int argc, char *argv[])
                                      */
                                     if (len > 0 && currentTab->command[len - 1] == '\\')
                                     {
-                                        /* Keep the newline for display, but remove the backslash. */
-                                        currentTab->command[len - 1] = '\n';
-                                        currentTab->command[len] = '\0';
-                                        currentTab->length = (int)len;
+                                        /* Retain backslash-newline so it can be removed only at execution. */
+                                        currentTab->command[len] = '\n';
+                                        currentTab->command[len + 1] = '\0';
+                                        currentTab->length = (int)(len + 1);
                                     }
                                     else
                                     {
@@ -3750,6 +3853,9 @@ int main(int argc, char *argv[])
                                         currentTab->command[len + 1] = '\0';
                                         currentTab->length = (int)(len + 1);
                                     }
+
+                                    /* Keep the insertion cursor after the continuation newline. */
+                                    currentTab->cursor_position = currentTab->length;
                                 }
 
                                 currentTab->continuing_command = 1;
@@ -3770,16 +3876,16 @@ int main(int argc, char *argv[])
 
                                 snprintf(command_copy, sizeof(command_copy), "%s",
                                          currentTab->command);
-                                /* Join lines continued with a backslash. */
-                                /* Remove the newline used for backslash continuation. */
+                                /* Remove only backslash-newline pairs; preserve quoted multiline newlines. */
                                 for (size_t i = 0; command_copy[i] != '\0'; i++)
                                 {
-                                    if (command_copy[i] == '\n' &&
-                                        currentTab->continuing_command)
+                                    if (command_copy[i] == '\\' && command_copy[i + 1] == '\n')
                                     {
                                         memmove(&command_copy[i],
-                                                &command_copy[i + 1],
-                                                strlen(&command_copy[i + 1]) + 1);
+                                                &command_copy[i + 2],
+                                                strlen(&command_copy[i + 2]) + 1);
+                                        if (i > 0)
+                                            i--;
                                     }
                                 }
 

@@ -138,7 +138,6 @@ Terminator/
 ├── README.md
 ├── DESIGN.md
 ├── tests/          # optional test scripts
-└── screenshots/    # optional screenshots
 ```
 
 ## Future enhancements

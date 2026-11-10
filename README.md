@@ -45,7 +45,7 @@ A working X server is also required to display the graphical terminal window. On
 Clone the repository and move into the project directory:
 
 ```bash
-git clone <your-repository-url>
+git clone https://github.com/Manas2011/Terminator
 cd Terminator
 ```
 
